@@ -1,0 +1,163 @@
+# -*- coding: utf-8 -*-
+import pandas as pd
+import numpy as np
+import sys
+from scipy.stats import binom
+from scipy.optimize import minimize
+from multiprocessing import Pool
+
+np.seterr(divide="ignore", invalid="ignore")
+
+
+def simple_lik(f, x, d):
+    nh = len(x)
+    p00 = (1 - f) ** 2
+    p01 = 2 * f * (1 - f)
+    p11 = f**2
+    lik00 = binom.pmf(x, d, p=0.5 * f) * p00
+    lik01 = binom.pmf(x, d, p=0.5 * (f + 0.5)) * p01
+    lik11 = binom.pmf(x, d, p=0.5 * (f + 1)) * p11
+    return np.sum(-np.log(lik00 + lik01 + lik11))
+
+
+def post_G(f, x, d):
+    nh = len(x)
+    p00 = (1 - f) ** 2
+    p01 = 2 * f * (1 - f)
+    p11 = f**2
+    lik00 = binom.pmf(x, d, p=0.5 * f) * p00
+    lik01 = binom.pmf(x, d, p=0.5 * (f + 0.5)) * p01
+    lik11 = binom.pmf(x, d, p=0.5 * (f + 1)) * p11
+    sump = lik00 + lik01 + lik11
+    return np.array([x / sump for x in [lik00, lik01, lik11]])
+
+
+def fit_model(data):
+    x, d = data
+    best_f = minimize(
+        simple_lik, x0=np.sum(x) / np.sum(d), args=(x, d), bounds=[(1e-4, 1 - 1e-4)]
+    )
+    pg = post_G(best_f.x[0], x, d)
+    return (best_f.x[0], pg)
+
+
+if __name__ == "__main__":
+    prfx = sys.argv[1]
+    nsnpcol = int(sys.argv[4])
+    ncpu = int(sys.argv[5])
+
+    counts = pd.read_csv(
+        prfx + "/" + sys.argv[3], delim_whitespace=True, header=0, iterator=True
+    )
+    depths = pd.read_csv(
+        prfx + "/" + sys.argv[2], delim_whitespace=True, header=0, iterator=True
+    )
+
+    name_out = sys.argv[6]
+
+    size = int(sys.argv[7])
+
+    d = depths.get_chunk(size)
+    c = counts.get_chunk(size)
+    npcounts = c.iloc[:, nsnpcol:].values
+    npdepths = d.iloc[:, nsnpcol:].values
+    npfreqs = np.divide(npcounts, npdepths)
+
+    ##### Run on all SNPs
+    with Pool(ncpu) as p:
+        res = p.map(fit_model, zip(npcounts, npdepths))
+
+    ## Allele frequencies
+    freqs = c.iloc[:, :nsnpcol]
+    freqs["f"] = [x[0] for x in res]
+    freqs["h"] = np.sum(npcounts, axis=1) / np.sum(npdepths, axis=1)
+    freqs.to_csv(prfx + "/" + name_out + ".freqs")
+
+    prob_gAA = pd.DataFrame(x[1][0] for x in res)
+    prob_gAA.columns = c.columns[nsnpcol:]
+    probAA = pd.concat(
+        [c.iloc[:, :nsnpcol], prob_gAA.set_index(c.iloc[:, :nsnpcol].index)], axis=1
+    )
+    probAA["geno"] = "AA"
+    prob_gAR = pd.DataFrame(x[1][1] for x in res)
+    prob_gAR.columns = c.columns[nsnpcol:]
+    probAR = pd.concat(
+        [c.iloc[:, :nsnpcol], prob_gAR.set_index(c.iloc[:, :nsnpcol].index)], axis=1
+    )
+    probAR["geno"] = "AR"
+    prob_gRR = pd.DataFrame(x[1][2] for x in res)
+    prob_gRR.columns = c.columns[nsnpcol:]
+    probRR = pd.concat(
+        [c.iloc[:, :nsnpcol], prob_gRR.set_index(c.iloc[:, :nsnpcol].index)], axis=1
+    )
+    probRR["geno"] = "RR"
+    frame = [probAA, probAR, probRR]
+    prob_g = pd.concat(frame)
+    prob_g.to_csv(prfx + "/" + name_out + ".prob")
+
+    ## Mean Genotypes
+    egs = pd.DataFrame([np.dot([0, 0.5, 1], x[1]) for x in res])
+    egs.columns = c.columns[nsnpcol:]
+    eg = pd.concat([c.iloc[:, :nsnpcol], egs], axis=1)
+    eg.to_csv(prfx + "/" + name_out + ".egs")
+
+    ## Best Genotypes
+    bgs = pd.DataFrame([np.argmax(x[1], axis=0) for x in res])
+    bgs.columns = c.columns[nsnpcol:]
+    bg = pd.concat([c.iloc[:, :nsnpcol], bgs], axis=1)
+    bg.to_csv(prfx + "/" + name_out + ".bgs")
+
+    while len(d) == size and len(c) == size:
+        d = depths.get_chunk(size)
+        c = counts.get_chunk(size)
+        npcounts = c.iloc[:, nsnpcol:].values
+        npdepths = d.iloc[:, nsnpcol:].values
+        npfreqs = np.divide(npcounts, npdepths)
+
+        ##### Run on all SNPs
+        with Pool(ncpu) as p:
+            res = p.map(fit_model, zip(npcounts, npdepths))
+
+        ## Allele frequencies
+        freqs = c.iloc[:, :nsnpcol]
+        freqs["f"] = [x[0] for x in res]
+        freqs["h"] = np.sum(npcounts, axis=1) / np.sum(npdepths, axis=1)
+        freqs.to_csv(prfx + "/" + name_out + ".freqs", mode="a", header=False)
+
+        ## Mean Genotypes
+        egs = pd.DataFrame([np.dot([0, 0.5, 1], x[1]) for x in res])
+        egs.columns = c.columns[nsnpcol:]
+        eg = pd.concat(
+            [c.iloc[:, :nsnpcol], egs.set_index(c.iloc[:, :nsnpcol].index)], axis=1
+        )
+        eg.to_csv(prfx + "/" + name_out + ".egs", mode="a", header=False)
+
+        ## Best Genotypes
+        bgs = pd.DataFrame([np.argmax(x[1], axis=0) for x in res])
+        bgs.columns = c.columns[nsnpcol:]
+        bg = pd.concat(
+            [c.iloc[:, :nsnpcol], bgs.set_index(c.iloc[:, :nsnpcol].index)], axis=1
+        )
+        bg.to_csv(prfx + "/" + name_out + ".bgs", mode="a", header=False)
+
+        prob_gAA = pd.DataFrame(x[1][0] for x in res)
+        prob_gAA.columns = c.columns[nsnpcol:]
+        probAA = pd.concat(
+            [c.iloc[:, :nsnpcol], prob_gAA.set_index(c.iloc[:, :nsnpcol].index)], axis=1
+        )
+        probAA["geno"] = "AA"
+        prob_gAR = pd.DataFrame(x[1][1] for x in res)
+        prob_gAR.columns = c.columns[nsnpcol:]
+        probAR = pd.concat(
+            [c.iloc[:, :nsnpcol], prob_gAR.set_index(c.iloc[:, :nsnpcol].index)], axis=1
+        )
+        probAR["geno"] = "AR"
+        prob_gRR = pd.DataFrame(x[1][2] for x in res)
+        prob_gRR.columns = c.columns[nsnpcol:]
+        probRR = pd.concat(
+            [c.iloc[:, :nsnpcol], prob_gRR.set_index(c.iloc[:, :nsnpcol].index)], axis=1
+        )
+        probRR["geno"] = "RR"
+        frame = [probAA, probAR, probRR]
+        prob_g = pd.concat(frame)
+        prob_g.to_csv(prfx + "/" + name_out + ".prob", mode="a", header=False)

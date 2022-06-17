@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+import sys
+import os
+import argparse
+import time
+import bz2
+import pickle
+import numpy as np
+import pandas as pd
+from fastphase import fastphase
+from fastphase.params import modParams
+from beethoven.data import WorkerPoolseqData, PanelFreqData, snplist_from_file
+from beethoven import poolstructmodels as sm
+
+
+def get_parser():
+    parser = argparse.ArgumentParser(description="Analyse PoolSeq Hive data")
+    parser.add_argument(
+        "datafiles", type=str, help="data file(s) to analyse", nargs="+"
+    )
+    parser.add_argument(
+        "--Fmatrix",
+        metavar="FILE",
+        default=None,
+        required=True,
+        help="Matrix of SNP Allele frequencies in reference populations",
+    )
+    parser.add_argument(
+        "--extract",
+        metavar="FILE",
+        default=None,
+        dest="snpfile",
+        help="keep only variants listed in FILE to fit STRUCTURE models",
+    )
+    parser.add_argument("-v", "--verbose", action="store_true", default=False)
+    parser.add_argument("-o", "--output", default=".", help="Output Directory")
+    parser.add_argument("--debug", default=False, action="store_true")
+    return parser
+
+
+def main():
+    myparser = get_parser()
+    myopts = myparser.parse_args()
+
+    print("\n[ Initialization ]")
+    fadm = PanelFreqData.from_file(myopts.Fmatrix)
+    print("Created", fadm)
+
+    if myopts.snpfile:
+        snplist = snplist_from_file(myopts.snpfile)
+        print(
+            "Read",
+            len(snplist),
+            "SNPs to extract out of which",
+            len(snplist & set(fadm.snplist)),
+            "are found in Fmatrix",
+        )
+    else:
+        snplist = None
+
+    print("Initialization Done.\n\n")
+    pooldat = []
+    for fic in myopts.datafiles:
+        pooldat = WorkerPoolseqData.from_count_depth(fic)
+        print("Created", pooldat)
+        prfx = os.path.basename(fic).split(".")[0]
+        mysnps = set(pooldat.snplist) & set(fadm.snplist)
+        print("Found", len(mysnps), "SNPs common to poolseq data and Fmatrix")
+        hdata = pooldat.get_data(mysnps)
+        fdata = fadm.get_data(mysnps)
+
+        if snplist is not None:
+            train_snps = list(mysnps & set(snplist))
+            try:
+                assert len(train_snps) > 0
+            except AssertionError:
+                print("\tNo common SNP found with Fmatrix : skipping this dataset")
+                continue
+            train_hdata = pooldat.get_data(train_snps)
+            train_fdata = fadm.get_data(train_snps)
+            print("\t after filtering will train model on", len(train_snps), "SNPs")
+            if myopts.debug:
+                hdata = train_hdata
+                fdata = train_fdata
+                mysnps = train_snps
+        else:
+            train_snps = list(mysnps)
+            train_hdata = hdata
+            train_fdata = fdata
+
+        try:
+            assert len(mysnps) > 0
+        except AssertionError:
+            print("\tNo common SNP found with Fmatrix : skipping this dataset")
+            continue
+
+        m = "st_het"
+        mod = sm.HeterogeneousModelBayes()
+
+        time_0 = time.time()
+
+        print("\n** Working with {}**".format(mod.name))
+        print("-- Parameter Estimation --")
+        pars = mod.estimate_parameters(
+            train_hdata["x"],
+            train_hdata["d"],
+            train_fdata["F"],
+            nstep=100,
+            delta_l=1e-5 * len(train_snps),
+            verbose=myopts.verbose,
+        )
+        time_est = time.time()
+        print("-- Genotype Prediction --")
+        genop = mod.predict(hdata["x"], hdata["d"], fdata["F"], pars)
+        time_pred = time.time()
+
+        print("Computation time:")
+        print("\t fit in %.3f seconds " % (time_est - time_0))
+        print("\t pred in %.3f seconds" % (time_pred - time_est))
+
+        print("Writing Output files")
+        _p = "_".join([prfx, m])
+        ## Q matrix
+        Q = pd.Series(pars["Q"], index=fadm.group_names, name=_p)
+        Q.to_csv(os.path.join(myopts.output, _p + ".Q"), header=False)
+        ## Genotypes predictions
+        with bz2.open(os.path.join(myopts.output, _p + ".geno.bz2"), "wt") as f:
+            print("CHROM POS X D P_AA P_AR P_RR EG BG f", file=f)
+            ## tuples naturally sort by successive value ordering
+            outsnps = [tuple(fadm.snps[name]) for name in mysnps]
+            for i, s in enumerate(outsnps):
+                print(
+                    s[0],
+                    s[1],
+                    hdata["x"][i],
+                    hdata["d"][i],
+                    *genop["postG"][
+                        i,
+                    ],
+                    genop["egs"][i],
+                    genop["bgs"][i],
+                    genop["Fdrone"][i],
+                    file=f
+                )
+
+
+if __name__ == "__main__":
+    main()
