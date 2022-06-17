@@ -28,7 +28,7 @@ will give you the syntax to run the program.
 
 The second `genoqueen_hom` is run like this:
 
-genoqueen_hom ${dir_in} depth.txt count_ref.txt ${n_col_snpid} ${ncpu} oprefix batch_len
+genoqueen_hom dir_in depth.txt count_ref.txt n_col_snpid ncpu oprefix batch_len
 
 - dir_in is the directory containing the input files
 - depth.txt and count_ref.txt contain the depth and counts information for a set
